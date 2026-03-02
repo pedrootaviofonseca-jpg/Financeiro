@@ -264,30 +264,54 @@ conn = get_conn()
 cursor = db_adapter.get_cursor(conn)
 
 
+def _get_active_schema() -> str:
+    """
+    Tenta descobrir o schema ativo no Postgres.
+    - Se o db_adapter tiver current_schema(), usa ele.
+    - Senão, usa 'public'.
+    """
+    try:
+        if hasattr(db_adapter, "current_schema"):
+            s = db_adapter.current_schema()
+            if s:
+                return str(s)
+    except Exception:
+        pass
+    return "public"
+
+
 def ensure_column(table: str, column: str, coltype: str):
     """
     Garante que a coluna existe em SQLite e Postgres.
     - SQLite: PRAGMA table_info
-    - Postgres: information_schema.columns + ADD COLUMN IF NOT EXISTS
+    - Postgres: information_schema.columns + ALTER TABLE ADD COLUMN IF NOT EXISTS
+
+    Importante:
+    - No Postgres, placeholders são %s (não '?')
+    - table_schema precisa ser resolvido corretamente (schema ativo / public)
     """
+    # Postgres
     if db_adapter.backend() == db_adapter.BACKEND_POSTGRES:
-        # Checa no Postgres
+        schema = _get_active_schema()
+
         cursor.execute(
             """
             SELECT 1
             FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = ?
-              AND column_name = ?
+            WHERE table_schema = %s
+              AND table_name   = %s
+              AND column_name  = %s
             LIMIT 1
             """,
-            (table, column),
+            (schema, table, column),
         )
         exists = cursor.fetchone() is not None
 
         if not exists:
             # IF NOT EXISTS evita erro se rodar 2x
-            cursor.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{column}" {coltype}')
+            cursor.execute(
+                f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "{column}" {coltype}'
+            )
             conn.commit()
         return
 
@@ -300,7 +324,11 @@ def ensure_column(table: str, column: str, coltype: str):
 
 
 def init_db():
-    # ✅ Use CURRENT_TIMESTAMP (funciona no SQLite e no Postgres)
+    """
+    Criação/garantia de tabelas.
+    Observação: SQLite aceita AUTOINCREMENT; Postgres não.
+    Seu db_adapter normalmente converte isso; se não converter, o Postgres vai reclamar.
+    """
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS usuarios (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -407,6 +435,9 @@ def init_db():
     """)
 
     conn.commit()
+
+    # ✅ Garantias (não vai mais quebrar no Postgres)
+    ensure_column("usuarios", "senha_hash", "TEXT")
 
     # Garantias para banco antigo (SQLite) e também seguro no Postgres
     ensure_column("usuarios", "senha_hash", "TEXT")
