@@ -2,7 +2,7 @@ import os
 import re
 import socket
 from typing import Any, Iterable, Optional, Sequence
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qs, unquote
 
 BACKEND_SQLITE = "sqlite"
 BACKEND_POSTGRES = "postgres"
@@ -48,7 +48,8 @@ def _ensure_sslmode(url: str) -> str:
 
 def _try_resolve_ipv4(hostname: str) -> Optional[str]:
     """
-    Tenta pegar um IPv4 (A record). Se o host só tiver IPv6, retorna None.
+    Tenta pegar um IPv4 (A record).
+    Se o host só tiver IPv6, retorna None.
     """
     try:
         infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
@@ -59,11 +60,77 @@ def _try_resolve_ipv4(hostname: str) -> Optional[str]:
     return None
 
 
+def _parse_database_url_loose(url: str) -> dict:
+    """
+    Parser "blindado" para DATABASE_URL mesmo quando a senha tem '@'.
+    Ex: postgresql://user:pass@com@host:5432/dbname?sslmode=require
+
+    Retorna kwargs compatíveis com psycopg2.connect(**kwargs)
+    """
+    url = _ensure_sslmode(url)
+
+    # remove scheme
+    if "://" in url:
+        _, rest = url.split("://", 1)
+    else:
+        rest = url
+
+    # separa query
+    if "?" in rest:
+        main_part, query_part = rest.split("?", 1)
+        q = {k: v[0] for k, v in parse_qs(query_part).items() if v}
+    else:
+        main_part = rest
+        q = {}
+
+    # separa credenciais do host usando o ÚLTIMO '@' (senha pode ter '@')
+    if "@" not in main_part:
+        raise RuntimeError("DATABASE_URL inválido: faltou '@' separando credenciais e host.")
+    auth_part, host_part = main_part.rsplit("@", 1)
+
+    # auth_part: user:pass  (pass pode ter ':' também, então split só 1x)
+    if ":" in auth_part:
+        user, password = auth_part.split(":", 1)
+    else:
+        user, password = auth_part, ""
+
+    user = unquote(user)
+    password = unquote(password)
+
+    # host_part: host:port/dbname
+    if "/" not in host_part:
+        raise RuntimeError("DATABASE_URL inválido: faltou '/dbname' no final.")
+    hostport, dbname = host_part.split("/", 1)
+
+    if ":" in hostport:
+        host, port_str = hostport.split(":", 1)
+        try:
+            port = int(port_str)
+        except Exception:
+            port = 5432
+    else:
+        host = hostport
+        port = 5432
+
+    dbname = (dbname or "postgres").strip()
+    sslmode = q.get("sslmode", "require")
+
+    return {
+        "host": host,
+        "port": port,
+        "dbname": dbname,
+        "user": user,
+        "password": password,
+        "sslmode": sslmode,
+    }
+
+
 def connect_postgres():
     """
-    Conexão Postgres (Supabase) robusta:
+    Conexão Postgres (Supabase) robusta para Streamlit Cloud:
     - exige sslmode=require
-    - tenta forçar IPv4 quando possível (evita Cannot assign requested address)
+    - NÃO quebra quando a senha tem '@'
+    - força IPv4 via hostaddr (evita Cannot assign requested address / IPv6)
     - timeout para não travar app
     """
     import psycopg2
@@ -74,22 +141,26 @@ def connect_postgres():
             "DATABASE_URL não definido. Configure em Streamlit → App → Settings → Secrets."
         )
 
-    url = _ensure_sslmode(url)
+    cfg = _parse_database_url_loose(url)
 
-    parsed = urlparse(url)
-    host = parsed.hostname
+    host = cfg["host"]
+    ipv4 = _try_resolve_ipv4(host)
 
-    # Se tiver host, tenta forçar IPv4. Se o host não tiver IPv4, deixa como está
-    # e você deve trocar o DATABASE_URL para o POOLER (recomendado).
-    if host:
-        ipv4 = _try_resolve_ipv4(host)
-        if ipv4:
-            # psycopg2 aceita 'hostaddr' (força o IP) mantendo o host original no DSN
-            # Para isso, conectamos via kwargs em vez de substituir a URL inteira.
-            return psycopg2.connect(url, connect_timeout=10, hostaddr=ipv4)
+    kwargs = dict(
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
+        host=host,                 # mantém hostname (bom para TLS/SNI)
+        port=cfg["port"],
+        sslmode=cfg["sslmode"],
+        connect_timeout=10,
+    )
 
-    # fallback normal
-    return psycopg2.connect(url, connect_timeout=10)
+    # hostaddr força o IP (IPv4) e evita que a conexão tente IPv6
+    if ipv4:
+        kwargs["hostaddr"] = ipv4
+
+    return psycopg2.connect(**kwargs)
 
 
 def _set_search_path(conn, schema: str):
@@ -123,9 +194,13 @@ def get_conn(sqlite_db_path: str, schema: Optional[str] = None):
 # Cursor adapter (SQLite SQL -> Postgres)
 # ----------------------------
 
+# strftime('%Y-%m', col) -> substr(col,1,7)
 _STRFTIME_RE = re.compile(r"strftime\(\s*'(%[^']+)'\s*,\s*([a-zA-Z0-9_\.]+)\s*\)")
+
+# PRAGMA table_info(tabela)
 _PRAGMA_TABLE_INFO_RE = re.compile(
-    r"PRAGMA\s+table_info\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*;?\s*$", re.IGNORECASE
+    r"PRAGMA\s+table_info\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*;?\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -168,6 +243,14 @@ def _convert_sqlite_master(sql: str) -> str:
 
 
 def _convert_pragma_table_info(sql: str) -> Optional[str]:
+    """
+    SQLite:
+      cursor.execute("PRAGMA table_info(usuarios)")
+      cols = [c[1] for c in cursor.fetchall()]
+
+    Postgres: devolve estrutura compatível:
+      (cid, name, type, notnull, dflt_value, pk)
+    """
     m = _PRAGMA_TABLE_INFO_RE.match(sql.strip())
     if not m:
         return None
@@ -201,10 +284,12 @@ def convert_sql(sql: str) -> Optional[str]:
     if not s:
         return s
 
+    # PRAGMA table_info(...) vira SELECT em information_schema
     pragma_conv = _convert_pragma_table_info(s)
     if pragma_conv:
         return pragma_conv
 
+    # Outros PRAGMAs: no-op no Postgres
     if s.upper().startswith("PRAGMA"):
         return None
 
