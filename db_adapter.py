@@ -1,6 +1,20 @@
 import os
 import re
-from typing import Any, Iterable, Optional, Sequence, Tuple
+from typing import Any, Iterable, Optional, Sequence
+
+# =========================================================
+# ✅ GARANTE DATABASE_URL vindo do Streamlit Secrets
+# - No Streamlit Cloud, Secrets nem sempre viram os.environ
+# - Então a gente puxa de st.secrets e joga no os.environ
+# - Fazemos isso AQUI porque todas as páginas importam db_adapter
+# =========================================================
+try:
+    import streamlit as st  # só existe quando rodando em Streamlit
+    if "DATABASE_URL" in st.secrets and not os.environ.get("DATABASE_URL"):
+        os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
+except Exception:
+    # rodando fora do Streamlit / sem secrets / etc.
+    pass
 
 BACKEND_SQLITE = "sqlite"
 BACKEND_POSTGRES = "postgres"
@@ -57,6 +71,7 @@ def get_conn(sqlite_db_path: str, schema: Optional[str] = None):
 # ----------------------------
 
 _STRFTIME_RE = re.compile(r"strftime\(\s*'(%[^']+)'\s*,\s*([a-zA-Z0-9_\.]+)\s*\)")
+
 def _convert_strftime(sql: str) -> str:
     def repl(m):
         fmt = m.group(1)
