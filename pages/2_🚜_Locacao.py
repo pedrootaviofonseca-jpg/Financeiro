@@ -249,11 +249,14 @@ def df_query(sql, params=()):
 
 
 def exec_sql(sql, params=()):
-    cursor.execute(sql, params# =========================
+    cursor.execute(sql, params
+    
+# =========================
 # BANCO (SQLite / Postgres via db_adapter)
 # =========================
 conn = db_adapter.get_conn("locacao.db", schema="locacao")
 cursor = db_adapter.get_cursor(conn)
+
 
 def _is_postgres() -> bool:
     try:
