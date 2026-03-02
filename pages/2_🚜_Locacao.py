@@ -3,6 +3,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import math
+import re
 from datetime import date, datetime, timedelta
 from io import BytesIO
 import os
@@ -238,20 +239,6 @@ def card_close():
 render_branding()
 
 # =========================
-# BANCO (SQLite)
-# =========================
-conn = db_adapter.get_conn("locacao.db", schema="locacao")
-cursor = db_adapter.get_cursor(conn)
-
-
-def df_query(sql, params=()):
-    return pd.read_sql_query(sql, conn, params=params)
-
-
-def exec_sql(sql, params=()):
-    cursor.execute(sql, params
-    
-# =========================
 # BANCO (SQLite / Postgres via db_adapter)
 # =========================
 conn = db_adapter.get_conn("locacao.db", schema="locacao")
@@ -264,6 +251,12 @@ def _is_postgres() -> bool:
     except Exception:
         return False
 
+def _adapt_sql(sql: str) -> str:
+    """Adapta placeholders entre SQLite (?) e Postgres (%s)."""
+    if _is_postgres():
+        return sql.replace("?", "%s")
+    return sql
+
 
 def df_query(sql, params=()):
     """
@@ -271,7 +264,7 @@ def df_query(sql, params=()):
     - Não use pd.read_sql_query direto, porque ele bypassa o CursorAdapter.
     - Aqui a gente executa via cursor (adaptado) e monta o DataFrame.
     """
-    cursor.execute(sql, params)
+    cursor.execute(_adapt_sql(sql), params)
     rows = cursor.fetchall()
     cols = [d[0] for d in (cursor.description or [])]
     return pd.DataFrame(rows, columns=cols)
@@ -282,7 +275,7 @@ def exec_sql(sql, params=()):
     Postgres: se der erro, precisa ROLLBACK senão a transação fica abortada.
     """
     try:
-        cursor.execute(sql, params)
+        cursor.execute(_adapt_sql(sql), params)
         conn.commit()
     except Exception:
         try:
@@ -299,7 +292,7 @@ def exec_sql_returning_id(sql, params=()) -> int:
     """
     if _is_postgres():
         try:
-            cursor.execute(sql, params)
+            cursor.execute(_adapt_sql(sql), params)
             new_id = cursor.fetchone()[0]
             conn.commit()
             return int(new_id)
@@ -316,10 +309,22 @@ def exec_sql_returning_id(sql, params=()) -> int:
 
 def coluna_existe(tabela: str, coluna: str) -> bool:
     try:
-        info = df_query(f"PRAGMA table_info({tabela})")
-        if info.empty:
-            return False
-        return coluna in info["name"].tolist()
+        if _is_postgres():
+            q = df_query(
+                """SELECT 1
+                   FROM information_schema.columns
+                   WHERE table_schema = current_schema()
+                     AND table_name = %s
+                     AND column_name = %s
+                   LIMIT 1""",
+                (tabela, coluna),
+            )
+            return not q.empty
+        else:
+            info = df_query(f"PRAGMA table_info({tabela})")
+            if info.empty:
+                return False
+            return coluna in info["name"].tolist()
     except Exception:
         return False
 
@@ -422,6 +427,225 @@ def criar_tabelas():
 
 
 criar_tabelas()
+
+# =========================
+# HELPERS (datas, valores, cálculos e estoque)
+# =========================
+def to_iso(d) -> str:
+    """Converte date/datetime/str para 'YYYY-MM-DD'."""
+    if d is None:
+        return ""
+    if isinstance(d, str):
+        # aceita 'YYYY-MM-DD' ou 'DD/MM/YYYY'
+        s = d.strip()
+        if not s:
+            return ""
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            return s
+        m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", s)
+        if m:
+            dd, mm, yy = m.groups()
+            return f"{yy}-{mm}-{dd}"
+        return s
+    if isinstance(d, datetime):
+        return d.date().strftime("%Y-%m-%d")
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    return str(d)
+
+def money(v) -> str:
+    try:
+        x = float(v or 0)
+    except Exception:
+        x = 0.0
+    # formato BR: 1.234,56
+    s = f"{x:,.2f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
+
+def last_day_of_month(ano: int, mes: int) -> date:
+    if mes == 12:
+        return date(ano, 12, 31)
+    return date(ano, mes + 1, 1) - timedelta(days=1)
+
+def month_add(ano: int, mes: int, delta: int) -> tuple[int, int]:
+    total = (ano * 12 + (mes - 1)) + int(delta)
+    a = total // 12
+    m = (total % 12) + 1
+    return int(a), int(m)
+
+def overlap_days(a_ini: date, a_fim: date, b_ini: date, b_fim: date) -> int:
+    """Dias (inclusive) de interseção entre [a_ini,a_fim] e [b_ini,b_fim]."""
+    ini = max(a_ini, b_ini)
+    fim = min(a_fim, b_fim)
+    if fim < ini:
+        return 0
+    return (fim - ini).days + 1
+
+def soma_recebida(loc_id: int) -> float:
+    v = df_query(
+        """SELECT COALESCE(SUM(valor),0) AS recebido
+            FROM recebimentos
+            WHERE locacao_id = ?""",
+        (int(loc_id),),
+    )
+    return float(v["recebido"][0] if not v.empty else 0.0)
+
+def atualizar_pago(loc_id: int):
+    """Marca locação como paga quando recebido >= total_final (tolerância de centavos)."""
+    loc = df_query("SELECT total_final FROM locacoes WHERE id=?", (int(loc_id),))
+    if loc.empty:
+        return
+    total = float(loc.loc[0, "total_final"] or 0)
+    recebido = soma_recebida(int(loc_id))
+    pago = 1 if (recebido + 0.009) >= total else 0
+    exec_sql("UPDATE locacoes SET pago=? WHERE id=?", (pago, int(loc_id)))
+
+def recalcular_disponivel_por_uso(maquina_id: int):
+    maq = df_query(
+        """SELECT id, quantidade_total, quantidade_manutencao
+            FROM maquinas WHERE id=?""",
+        (int(maquina_id),),
+    )
+    if maq.empty:
+        return
+
+    total = int(maq.loc[0, "quantidade_total"] or 0)
+    manut = int(maq.loc[0, "quantidade_manutencao"] or 0)
+
+    alugadas = df_query(
+        """SELECT COALESCE(SUM(li.quantidade),0) AS alugadas
+            FROM locacao_itens li
+            JOIN locacoes l ON l.id = li.locacao_id
+            WHERE l.status='Em andamento'
+              AND li.maquina_id=?""",
+        (int(maquina_id),),
+    )
+    alug = int(alugadas["alugadas"][0] if not alugadas.empty else 0)
+
+    disp = max(0, total - manut - alug)
+    exec_sql(
+        """UPDATE maquinas
+            SET quantidade_disponivel=?
+            WHERE id=?""",
+        (int(disp), int(maquina_id)),
+    )
+
+def recalcular_disponivel_todas():
+    ids = df_query("SELECT id FROM maquinas")
+    for mid in ids["id"].tolist() if not ids.empty else []:
+        recalcular_disponivel_por_uso(int(mid))
+
+def calcular_total_locacao(loc_id: int, data_fech: date) -> dict:
+    """Calcula total da locação até uma data de fechamento."""
+    loc = df_query(
+        """SELECT id, data_inicio, modo_cobranca, frete_ida, frete_volta, desconto
+            FROM locacoes WHERE id=?""",
+        (int(loc_id),),
+    )
+    if loc.empty:
+        return {"erro": "Locação não encontrada."}
+
+    di = datetime.strptime(str(loc.loc[0, "data_inicio"]), "%Y-%m-%d").date()
+    df = data_fech
+    if df < di:
+        return {"erro": "Data de fechamento não pode ser anterior ao início."}
+
+    dias = (df - di).days + 1
+    modo = str(loc.loc[0, "modo_cobranca"] or "Diária").strip()
+    periodo = int(dias) if modo != "Mensal" else int(max(1, math.ceil(dias / 30.0)))
+
+    itens = df_query(
+        """SELECT li.maquina_id, li.quantidade, li.valor_diaria, li.valor_mensal,
+                  m.descricao
+            FROM locacao_itens li
+            JOIN maquinas m ON m.id = li.maquina_id
+            WHERE li.locacao_id=?""",
+        (int(loc_id),),
+    )
+    if itens.empty:
+        return {"erro": "Esta locação não tem itens."}
+
+    detalhes = []
+    subtotal = 0.0
+    for _, r in itens.iterrows():
+        qtd = int(r["quantidade"] or 0)
+        if modo == "Mensal":
+            unit = float(r["valor_mensal"] or 0)
+            linha = unit * qtd * periodo
+        else:
+            unit = float(r["valor_diaria"] or 0)
+            linha = unit * qtd * dias
+        subtotal += linha
+        detalhes.append({
+            "Máquina": str(r["descricao"]),
+            "Qtd": qtd,
+            "Modo": modo,
+            "Período": periodo if modo == "Mensal" else dias,
+            "Unitário": float(unit),
+            "Total": float(linha),
+        })
+
+    frete_ida = float(loc.loc[0, "frete_ida"] or 0)
+    frete_volta = float(loc.loc[0, "frete_volta"] or 0)
+    desconto = float(loc.loc[0, "desconto"] or 0)
+
+    total_geral = max(0.0, subtotal + frete_ida + frete_volta - desconto)
+
+    return {
+        "modo": modo,
+        "periodo": periodo if modo == "Mensal" else dias,
+        "subtotal": float(subtotal),
+        "frete_ida": frete_ida,
+        "frete_volta": frete_volta,
+        "desconto": desconto,
+        "total_geral": float(total_geral),
+        "detalhes": detalhes,
+    }
+
+def fechar_locacao(loc_id: int, data_fech: date) -> dict:
+    calc = calcular_total_locacao(int(loc_id), data_fech)
+    if calc.get("erro"):
+        return calc
+
+    fechado_em = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exec_sql(
+        """UPDATE locacoes
+            SET status='Finalizado',
+                data_fim_real=?,
+                total_final=?,
+                fechado_em=?
+            WHERE id=?""",
+        (to_iso(data_fech), float(calc["total_geral"]), fechado_em, int(loc_id)),
+    )
+
+    recalcular_disponivel_todas()
+    return {"ok": True, "total": float(calc["total_geral"])}
+
+def fechar_e_reabrir_todas_cliente(cliente_id: int, data_fech: date, reabrir_dia_seguinte: bool) -> dict:
+    locs = df_query(
+        """SELECT id FROM locacoes
+            WHERE status='Em andamento' AND cliente_id=?
+            ORDER BY id""",
+        (int(cliente_id),),
+    )
+    if locs.empty:
+        return {"erro": "Nenhuma locação aberta para este cliente."}
+
+    fechadas = []
+    reabertas = []
+
+    for lid in locs["id"].tolist():
+        res = fechar_locacao(int(lid), data_fech)
+        if res.get("erro"):
+            return {"erro": f"Erro ao fechar locação {lid}: {res['erro']}"}
+        fechadas.append(int(lid))
+
+        nova_data = data_fech + timedelta(days=1) if reabrir_dia_seguinte else data_fech
+        novo_id = reabrir_locacao_mesmos_itens(int(lid), nova_data)
+        reabertas.append(int(novo_id))
+
+    return {"fechadas": fechadas, "reabertas": reabertas, "nova_data": nova_data}
 
 
 # =========================
