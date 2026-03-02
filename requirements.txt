@@ -1,0 +1,6 @@
+streamlit
+pandas
+reportlab
+openpyxl
+python-dateutil
+psycopg2-binary
