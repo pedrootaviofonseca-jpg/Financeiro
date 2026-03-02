@@ -249,8 +249,66 @@ def df_query(sql, params=()):
 
 
 def exec_sql(sql, params=()):
+    cursor.execute(sql, params# =========================
+# BANCO (SQLite / Postgres via db_adapter)
+# =========================
+conn = db_adapter.get_conn("locacao.db", schema="locacao")
+cursor = db_adapter.get_cursor(conn)
+
+def _is_postgres() -> bool:
+    try:
+        return db_adapter.backend() == db_adapter.BACKEND_POSTGRES
+    except Exception:
+        return False
+
+
+def df_query(sql, params=()):
+    """
+    IMPORTANTE:
+    - Não use pd.read_sql_query direto, porque ele bypassa o CursorAdapter.
+    - Aqui a gente executa via cursor (adaptado) e monta o DataFrame.
+    """
     cursor.execute(sql, params)
-    conn.commit()
+    rows = cursor.fetchall()
+    cols = [d[0] for d in (cursor.description or [])]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def exec_sql(sql, params=()):
+    """
+    Postgres: se der erro, precisa ROLLBACK senão a transação fica abortada.
+    """
+    try:
+        cursor.execute(sql, params)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def exec_sql_returning_id(sql, params=()) -> int:
+    """
+    Para INSERT no Postgres, use RETURNING id.
+    No SQLite, a gente pega last_insert_rowid().
+    """
+    if _is_postgres():
+        try:
+            cursor.execute(sql, params)
+            new_id = cursor.fetchone()[0]
+            conn.commit()
+            return int(new_id)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+    else:
+        exec_sql(sql, params)
+        return int(df_query("SELECT last_insert_rowid() AS id")["id"][0])
 
 
 def coluna_existe(tabela: str, coluna: str) -> bool:
@@ -264,7 +322,8 @@ def coluna_existe(tabela: str, coluna: str) -> bool:
 
 
 def criar_tabelas():
-    cursor.execute("""
+    # --- clientes (primeiro, porque locacoes referencia clientes) ---
+    exec_sql("""
     CREATE TABLE IF NOT EXISTS clientes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         nome TEXT NOT NULL,
@@ -275,13 +334,18 @@ def criar_tabelas():
         cliente_fixo INTEGER DEFAULT 0
     )
     """)
+
     if not coluna_existe("clientes", "cliente_fixo"):
         try:
-            exec_sql("ALTER TABLE clientes ADD COLUMN cliente_fixo INTEGER DEFAULT 0")
+            if _is_postgres():
+                exec_sql('ALTER TABLE clientes ADD COLUMN IF NOT EXISTS cliente_fixo INTEGER DEFAULT 0')
+            else:
+                exec_sql("ALTER TABLE clientes ADD COLUMN cliente_fixo INTEGER DEFAULT 0")
         except Exception:
             pass
 
-    cursor.execute("""
+    # --- maquinas (antes de locacao_itens) ---
+    exec_sql("""
     CREATE TABLE IF NOT EXISTS maquinas (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         codigo TEXT,
@@ -296,13 +360,14 @@ def criar_tabelas():
     )
     """)
 
-    cursor.execute("""
+    # --- locacoes (depois de clientes) ---
+    exec_sql("""
     CREATE TABLE IF NOT EXISTS locacoes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         cliente_id INTEGER NOT NULL,
         data_inicio TEXT NOT NULL,
-        status TEXT DEFAULT 'Em andamento',            -- Em andamento / Finalizado / Cancelado
-        modo_cobranca TEXT DEFAULT 'Diária',           -- Diária / Mensal
+        status TEXT DEFAULT 'Em andamento',
+        modo_cobranca TEXT DEFAULT 'Diária',
         frete_ida REAL DEFAULT 0,
         frete_volta REAL DEFAULT 0,
         desconto REAL DEFAULT 0,
@@ -315,13 +380,18 @@ def criar_tabelas():
         FOREIGN KEY(cliente_id) REFERENCES clientes(id)
     )
     """)
+
     if not coluna_existe("locacoes", "pago"):
         try:
-            exec_sql("ALTER TABLE locacoes ADD COLUMN pago INTEGER DEFAULT 0")
+            if _is_postgres():
+                exec_sql('ALTER TABLE locacoes ADD COLUMN IF NOT EXISTS pago INTEGER DEFAULT 0')
+            else:
+                exec_sql("ALTER TABLE locacoes ADD COLUMN pago INTEGER DEFAULT 0")
         except Exception:
             pass
 
-    cursor.execute("""
+    # --- locacao_itens (depois de locacoes e maquinas) ---
+    exec_sql("""
     CREATE TABLE IF NOT EXISTS locacao_itens (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         locacao_id INTEGER NOT NULL,
@@ -334,7 +404,8 @@ def criar_tabelas():
     )
     """)
 
-    cursor.execute("""
+    # --- recebimentos (depois de locacoes) ---
+    exec_sql("""
     CREATE TABLE IF NOT EXISTS recebimentos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         locacao_id INTEGER NOT NULL,
@@ -346,178 +417,13 @@ def criar_tabelas():
     )
     """)
 
-    conn.commit()
-
 
 criar_tabelas()
 
+
 # =========================
-# HELPERS
+# PATCH: reabrir_locacao_mesmos_itens (Postgres não tem last_insert_rowid)
 # =========================
-def to_iso(d: date) -> str:
-    return d.strftime("%Y-%m-%d")
-
-
-def money(v) -> str:
-    try:
-        return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return "R$ 0,00"
-
-
-def last_day_of_month(ano: int, mes: int) -> date:
-    if mes == 12:
-        return date(ano, 12, 31)
-    return date(ano, mes + 1, 1) - timedelta(days=1)
-
-
-def month_add(ano: int, mes: int, delta: int):
-    idx = (ano * 12 + (mes - 1)) + delta
-    novo_ano = idx // 12
-    novo_mes = (idx % 12) + 1
-    return novo_ano, novo_mes
-
-
-def overlap_days(a_start: date, a_end: date, b_start: date, b_end: date) -> int:
-    start = max(a_start, b_start)
-    end = min(a_end, b_end)
-    if end < start:
-        return 0
-    return (end - start).days + 1
-
-
-def recalcular_disponivel_por_uso(maquina_id: int):
-    m = df_query("""
-        SELECT quantidade_total, quantidade_manutencao
-        FROM maquinas
-        WHERE id=?
-    """, (int(maquina_id),))
-    if m.empty:
-        return
-
-    total = int(m.loc[0, "quantidade_total"] or 0)
-    manut = int(m.loc[0, "quantidade_manutencao"] or 0)
-
-    alugado = df_query("""
-        SELECT COALESCE(SUM(li.quantidade),0) as qtd
-        FROM locacao_itens li
-        JOIN locacoes l ON l.id = li.locacao_id
-        WHERE li.maquina_id = ?
-          AND l.status = 'Em andamento'
-    """, (int(maquina_id),))["qtd"][0]
-    alugado = int(alugado or 0)
-
-    disp = max(0, total - manut - alugado)
-    exec_sql("UPDATE maquinas SET quantidade_disponivel=? WHERE id=?", (disp, int(maquina_id)))
-
-
-def recalcular_disponivel_todas():
-    ids = df_query("SELECT id FROM maquinas")
-    for mid in ids["id"].tolist():
-        recalcular_disponivel_por_uso(int(mid))
-
-
-def calcular_periodo(data_ini_str: str, data_fim_str: str, modo: str) -> int:
-    di = datetime.strptime(data_ini_str, "%Y-%m-%d").date()
-    df = datetime.strptime(data_fim_str, "%Y-%m-%d").date()
-    dias = (df - di).days
-    if dias < 0:
-        return 0
-    dias = max(1, dias + 1)
-    if modo == "Mensal":
-        return int(math.ceil(dias / 30.0))
-    return int(dias)
-
-
-def soma_recebida(loc_id: int) -> float:
-    v = df_query("""
-        SELECT COALESCE(SUM(valor),0) as total
-        FROM recebimentos
-        WHERE locacao_id=?
-    """, (int(loc_id),))["total"][0]
-    return float(v or 0)
-
-
-def atualizar_pago(loc_id: int):
-    l = df_query("SELECT total_final, status FROM locacoes WHERE id=?", (int(loc_id),))
-    if l.empty:
-        return
-    status = (l.loc[0, "status"] or "").strip()
-    total = float(l.loc[0, "total_final"] or 0)
-    recebido = soma_recebida(loc_id)
-
-    if status == "Finalizado" and total > 0 and recebido >= total - 0.00001:
-        exec_sql("UPDATE locacoes SET pago=1 WHERE id=?", (int(loc_id),))
-    else:
-        exec_sql("UPDATE locacoes SET pago=0 WHERE id=?", (int(loc_id),))
-
-
-def calcular_total_locacao(loc_id: int, data_fechamento: date):
-    l = df_query("""
-        SELECT id, data_inicio, modo_cobranca, frete_ida, frete_volta, desconto
-        FROM locacoes WHERE id=?
-    """, (int(loc_id),))
-    if l.empty:
-        return {"erro": "Locação não encontrada."}
-
-    data_inicio = l.loc[0, "data_inicio"]
-    modo = (l.loc[0, "modo_cobranca"] or "Diária").strip()
-    frete_ida = float(l.loc[0, "frete_ida"] or 0)
-    frete_volta = float(l.loc[0, "frete_volta"] or 0)
-    desconto = float(l.loc[0, "desconto"] or 0)
-
-    periodo = calcular_periodo(data_inicio, to_iso(data_fechamento), modo)
-    if periodo <= 0:
-        return {"erro": "A data de fechamento não pode ser menor que a data de início."}
-
-    itens = df_query("""
-        SELECT m.descricao, li.quantidade, li.valor_diaria, li.valor_mensal
-        FROM locacao_itens li
-        JOIN maquinas m ON m.id = li.maquina_id
-        WHERE li.locacao_id=?
-    """, (int(loc_id),))
-
-    total_itens = 0.0
-    detalhes = []
-    for _, r in itens.iterrows():
-        qtd = int(r["quantidade"] or 1)
-        vd = float(r["valor_diaria"] or 0)
-        vm = float(r["valor_mensal"] or 0)
-        preco = vd if modo == "Diária" else vm
-        subtotal = float(preco) * qtd * periodo
-        total_itens += subtotal
-        detalhes.append({
-            "Máquina": r["descricao"],
-            "Qtd": qtd,
-            "Preço": money(preco),
-            "Período": periodo,
-            "Subtotal": money(subtotal),
-        })
-
-    total_geral = total_itens + frete_ida + frete_volta - desconto
-    return {"modo": modo, "periodo": periodo, "detalhes": detalhes, "total_geral": total_geral}
-
-
-def fechar_locacao(loc_id: int, data_fechamento: date):
-    calc = calcular_total_locacao(loc_id, data_fechamento)
-    if calc.get("erro"):
-        return calc
-
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    exec_sql("""
-        UPDATE locacoes
-        SET status='Finalizado',
-            data_fim_real=?,
-            total_final=?,
-            fechado_em=?
-        WHERE id=?
-    """, (to_iso(data_fechamento), float(calc["total_geral"]), agora, int(loc_id)))
-
-    recalcular_disponivel_todas()
-    atualizar_pago(loc_id)
-    return calc
-
-
 def reabrir_locacao_mesmos_itens(loc_id: int, nova_data_inicio: date) -> int:
     base = df_query("""
         SELECT cliente_id, modo_cobranca, frete_ida, frete_volta, desconto, observacoes
@@ -535,13 +441,22 @@ def reabrir_locacao_mesmos_itens(loc_id: int, nova_data_inicio: date) -> int:
     obs = str(base.loc[0, "observacoes"] or "")
     criado_em = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    exec_sql("""
-        INSERT INTO locacoes (cliente_id, data_inicio, status, modo_cobranca,
-                              frete_ida, frete_volta, desconto, observacoes, criado_em, pago)
-        VALUES (?, ?, 'Em andamento', ?, ?, ?, ?, ?, ?, 0)
-    """, (cliente_id, to_iso(nova_data_inicio), modo, frete_ida, frete_volta, desconto, obs, criado_em))
-
-    novo_id = int(df_query("SELECT last_insert_rowid() as id")["id"][0])
+    if _is_postgres():
+        novo_id = exec_sql_returning_id("""
+            INSERT INTO locacoes (
+                cliente_id, data_inicio, status, modo_cobranca,
+                frete_ida, frete_volta, desconto, observacoes, criado_em, pago
+            )
+            VALUES (%s, %s, 'Em andamento', %s, %s, %s, %s, %s, %s, 0)
+            RETURNING id
+        """, (cliente_id, to_iso(nova_data_inicio), modo, frete_ida, frete_volta, desconto, obs, criado_em))
+    else:
+        exec_sql("""
+            INSERT INTO locacoes (cliente_id, data_inicio, status, modo_cobranca,
+                                  frete_ida, frete_volta, desconto, observacoes, criado_em, pago)
+            VALUES (?, ?, 'Em andamento', ?, ?, ?, ?, ?, ?, 0)
+        """, (cliente_id, to_iso(nova_data_inicio), modo, frete_ida, frete_volta, desconto, obs, criado_em))
+        novo_id = int(df_query("SELECT last_insert_rowid() as id")["id"][0])
 
     itens = df_query("""
         SELECT maquina_id, quantidade, valor_diaria, valor_mensal
@@ -557,33 +472,7 @@ def reabrir_locacao_mesmos_itens(loc_id: int, nova_data_inicio: date) -> int:
               float(r["valor_diaria"] or 0), float(r["valor_mensal"] or 0)))
 
     recalcular_disponivel_todas()
-    return novo_id
-
-
-def fechar_e_reabrir_todas_cliente(cliente_id: int, data_fechamento: date, reabrir_dia_seguinte: bool):
-    abertas_ids = df_query("""
-        SELECT id FROM locacoes
-        WHERE status='Em andamento' AND cliente_id=?
-        ORDER BY id
-    """, (int(cliente_id),))
-
-    if abertas_ids.empty:
-        return {"erro": "Este cliente não tem locações abertas para fechar."}
-
-    # fecha todas
-    for loc_id in abertas_ids["id"].tolist():
-        res = fechar_locacao(int(loc_id), data_fechamento)
-        if res.get("erro"):
-            return {"erro": f"Erro ao fechar a locação {loc_id}: {res['erro']}"}
-
-    # reabre todas
-    nova_data = data_fechamento + timedelta(days=1) if reabrir_dia_seguinte else data_fechamento
-    novos = []
-    for loc_id in abertas_ids["id"].tolist():
-        novo_id = reabrir_locacao_mesmos_itens(int(loc_id), nova_data)
-        novos.append(int(novo_id))
-
-    return {"ok": True, "fechadas": abertas_ids["id"].tolist(), "reabertas": novos, "nova_data": nova_data}
+    return int(novo_id)
 
 
 # =========================
