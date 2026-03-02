@@ -150,7 +150,7 @@ def connect_postgres():
         dbname=cfg["dbname"],
         user=cfg["user"],
         password=cfg["password"],
-        host=host,                 # mantém hostname (bom para TLS/SNI)
+        host=host,  # mantém hostname (bom para TLS/SNI)
         port=cfg["port"],
         sslmode=cfg["sslmode"],
         connect_timeout=10,
@@ -311,14 +311,29 @@ class CursorAdapter:
         sql2 = convert_sql(sql)
         if sql2 is None:
             return self
-        self._cur.execute(sql2, params)
+        try:
+            self._cur.execute(sql2, params)
+        except Exception:
+            # ✅ evita InFailedSqlTransaction no Postgres
+            try:
+                self._cur.connection.rollback()
+            except Exception:
+                pass
+            raise
         return self
 
     def executemany(self, sql: str, seq_of_params: Iterable[Sequence[Any]]):
         sql2 = convert_sql(sql)
         if sql2 is None:
             return self
-        self._cur.executemany(sql2, seq_of_params)
+        try:
+            self._cur.executemany(sql2, seq_of_params)
+        except Exception:
+            try:
+                self._cur.connection.rollback()
+            except Exception:
+                pass
+            raise
         return self
 
     def fetchall(self):
