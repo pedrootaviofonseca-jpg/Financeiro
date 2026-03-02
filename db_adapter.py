@@ -43,7 +43,7 @@ def connect_postgres():
     """
     Conexão Postgres (Supabase) robusta para Streamlit Cloud:
     - garante sslmode=require
-    - força resolver IPv4 (evita: Cannot assign requested address)
+    - força IPv4 REAL (evita: Cannot assign requested address / IPv6)
     - timeout para não travar app
     """
     import psycopg2
@@ -57,18 +57,30 @@ def connect_postgres():
         sep = "&" if "?" in url else "?"
         url = url + f"{sep}sslmode=require"
 
-    # ===== Forçar IPv4 (resolve vários casos no Streamlit Cloud) =====
     parsed = urlparse(url)
     host = parsed.hostname
+    port = parsed.port or 5432
+
+    host_ipv4 = None
     if host:
         try:
-            host_ipv4 = socket.gethostbyname(host)  # força resolução IPv4
-            # troca apenas a primeira ocorrência do host pelo IPv4
-            url = url.replace(host, host_ipv4, 1)
+            # pega SOMENTE endereços IPv4
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            host_ipv4 = infos[0][4][0]
         except Exception:
-            # se falhar, tenta conectar do jeito normal
-            pass
+            host_ipv4 = None
 
+    if host_ipv4:
+        # Conecta usando o IP (IPv4) via hostaddr, evitando que o psycopg tente IPv6
+        return psycopg2.connect(
+            url,
+            connect_timeout=10,
+            hostaddr=host_ipv4,
+            host=host,
+            port=port,
+        )
+
+    # fallback normal
     return psycopg2.connect(url, connect_timeout=10)
 
 
