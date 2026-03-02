@@ -1,6 +1,8 @@
 import os
 import re
+import socket
 from typing import Any, Iterable, Optional, Sequence
+from urllib.parse import urlparse
 
 BACKEND_SQLITE = "sqlite"
 BACKEND_POSTGRES = "postgres"
@@ -18,10 +20,8 @@ def _get_database_url() -> Optional[str]:
 
     try:
         import streamlit as st  # type: ignore
-        # st.secrets pode existir mesmo sem DATABASE_URL
         url = st.secrets.get("DATABASE_URL")  # type: ignore
         if url:
-            # garante também em os.environ para libs que dependem disso
             os.environ["DATABASE_URL"] = str(url)
             return str(url)
     except Exception:
@@ -40,6 +40,12 @@ def connect_sqlite(db_path: str):
 
 
 def connect_postgres():
+    """
+    Conexão Postgres (Supabase) robusta para Streamlit Cloud:
+    - garante sslmode=require
+    - força resolver IPv4 (evita: Cannot assign requested address)
+    - timeout para não travar app
+    """
     import psycopg2
 
     url = _get_database_url()
@@ -51,7 +57,19 @@ def connect_postgres():
         sep = "&" if "?" in url else "?"
         url = url + f"{sep}sslmode=require"
 
-    return psycopg2.connect(url)
+    # ===== Forçar IPv4 (resolve vários casos no Streamlit Cloud) =====
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if host:
+        try:
+            host_ipv4 = socket.gethostbyname(host)  # força resolução IPv4
+            # troca apenas a primeira ocorrência do host pelo IPv4
+            url = url.replace(host, host_ipv4, 1)
+        except Exception:
+            # se falhar, tenta conectar do jeito normal
+            pass
+
+    return psycopg2.connect(url, connect_timeout=10)
 
 
 def _set_search_path(conn, schema: str):
@@ -69,6 +87,25 @@ def ensure_schema(conn, schema: str):
     cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
     conn.commit()
     _set_search_path(conn, schema)
+
+
+def current_schema() -> Optional[str]:
+    """
+    Retorna o schema ativo no Postgres (se disponível).
+    """
+    if backend() != BACKEND_POSTGRES:
+        return None
+    try:
+        conn = connect_postgres()
+        cur = conn.cursor()
+        cur.execute("SELECT current_schema()")
+        s = cur.fetchone()
+        conn.close()
+        if s and s[0]:
+            return str(s[0])
+    except Exception:
+        pass
+    return None
 
 
 def get_conn(sqlite_db_path: str, schema: Optional[str] = None):
@@ -89,7 +126,9 @@ def get_conn(sqlite_db_path: str, schema: Optional[str] = None):
 _STRFTIME_RE = re.compile(r"strftime\(\s*'(%[^']+)'\s*,\s*([a-zA-Z0-9_\.]+)\s*\)")
 
 # PRAGMA table_info(tabela)
-_PRAGMA_TABLE_INFO_RE = re.compile(r"PRAGMA\s+table_info\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*;?\s*$", re.IGNORECASE)
+_PRAGMA_TABLE_INFO_RE = re.compile(
+    r"PRAGMA\s+table_info\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*;?\s*$", re.IGNORECASE
+)
 
 
 def _convert_strftime(sql: str) -> str:
