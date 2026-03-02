@@ -1,4 +1,9 @@
 import streamlit as st
+import os
+
+# 🔐 Conecta Secrets (Streamlit Cloud) ao sistema
+if "DATABASE_URL" in st.secrets and not os.environ.get("DATABASE_URL"):
+    os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
 
 st.set_page_config(page_title="Sistema Unificado", layout="wide")
 st.title("Sistema Unificado")
