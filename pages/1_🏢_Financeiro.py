@@ -254,15 +254,44 @@ SITUACOES = ["Pago", "Em aberto"]
 # =========================
 # BANCO DE DADOS
 # =========================
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+# Usa o adapter unificado (SQLite local / Postgres Supabase)
+# DB_PATH = caminho do seu .db (já existe no seu código)
+def get_conn():
+    return db_adapter.get_conn(DB_PATH)
 
 conn = get_conn()
 cursor = db_adapter.get_cursor(conn)
 
 
 def ensure_column(table: str, column: str, coltype: str):
+    """
+    Garante que a coluna existe em SQLite e Postgres.
+    - SQLite: PRAGMA table_info
+    - Postgres: information_schema.columns + ADD COLUMN IF NOT EXISTS
+    """
+    if db_adapter.backend() == db_adapter.BACKEND_POSTGRES:
+        # Checa no Postgres
+        cursor.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = ?
+              AND column_name = ?
+            LIMIT 1
+            """,
+            (table, column),
+        )
+        exists = cursor.fetchone() is not None
+
+        if not exists:
+            # IF NOT EXISTS evita erro se rodar 2x
+            cursor.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{column}" {coltype}')
+            conn.commit()
+        return
+
+    # SQLite
     cursor.execute(f"PRAGMA table_info({table})")
     cols = [c[1] for c in cursor.fetchall()]
     if column not in cols:
@@ -271,6 +300,7 @@ def ensure_column(table: str, column: str, coltype: str):
 
 
 def init_db():
+    # ✅ Use CURRENT_TIMESTAMP (funciona no SQLite e no Postgres)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS usuarios (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,7 +342,7 @@ def init_db():
         forma_pagamento TEXT,   -- Dinheiro, Cheque, Cartão
         parcelas INTEGER,
         primeiro_debito TEXT,   -- ISO: YYYY-MM-DD
-        criado_em TEXT,        -- ISO: YYYY-MM-DD (data de criação do lançamento)
+        criado_em TEXT,         -- ISO: YYYY-MM-DD (data de criação do lançamento)
         situacao TEXT           -- Pago, Em aberto
     )
     """)
@@ -324,11 +354,10 @@ def init_db():
         parcela_num INTEGER NOT NULL,
         data_debito TEXT NOT NULL,     -- ISO: YYYY-MM-DD
         paga INTEGER DEFAULT 0,        -- 0/1
-        data_quitacao TEXT,           -- ISO: YYYY-MM-DD (data efetiva de quitação)
+        data_quitacao TEXT,            -- ISO: YYYY-MM-DD (data efetiva de quitação)
         UNIQUE(lancamento_id, parcela_num)
     )
     """)
-
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS extratos_diarios (
@@ -339,7 +368,7 @@ def init_db():
         saldo_inicio REAL,
         saldo_fim REAL,
         usuario TEXT,
-        criado_em TEXT DEFAULT (datetime('now')),
+        criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(empresa, conta_bancaria, data_ref)
     )
     """)
@@ -356,16 +385,14 @@ def init_db():
     )
     """)
 
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS configuracoes_empresa (
         empresa TEXT PRIMARY KEY,
         trava_mes_apos_fim INTEGER DEFAULT 1,
-        atualizado_em TEXT DEFAULT (datetime('now')),
+        atualizado_em TEXT DEFAULT CURRENT_TIMESTAMP,
         atualizado_por TEXT
     )
     """)
-
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS dias_fechados (
@@ -379,10 +406,9 @@ def init_db():
     )
     """)
 
-
     conn.commit()
 
-    # Garantias para banco antigo
+    # Garantias para banco antigo (SQLite) e também seguro no Postgres
     ensure_column("usuarios", "senha_hash", "TEXT")
     ensure_column("dados", "tipo", "TEXT")
     ensure_column("dados", "numero_item", "INTEGER")
@@ -404,8 +430,7 @@ def init_db():
     ensure_column("extratos_diarios", "usuario", "TEXT")
     ensure_column("extratos_diarios", "criado_em", "TEXT")
 
-
-        # ✅ Migração: se o banco era antigo e não tinha 'criado_em',
+    # ✅ Migração: se o banco era antigo e não tinha 'criado_em',
     # preenche com 'data_operacao' para não quebrar filtros.
     try:
         cursor.execute(
@@ -419,7 +444,7 @@ def init_db():
     except Exception:
         pass
 
-# Usuário padrão
+    # Usuário padrão
     cursor.execute("SELECT COUNT(1) FROM usuarios")
     if (cursor.fetchone()[0] or 0) == 0:
         cursor.execute(
