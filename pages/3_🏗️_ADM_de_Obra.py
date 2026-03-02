@@ -678,7 +678,7 @@ CREATE TABLE IF NOT EXISTS pagamentos_mao_obra (
     obra_id INTEGER NOT NULL,
     profissional_id INTEGER NOT NULL,
     valor_pago REAL NOT NULL DEFAULT 0,
-    atualizado_em TEXT NOT NULL DEFAULT (datetime('now')),
+    atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(periodo_id, obra_id, profissional_id)
 )
 """)
@@ -691,7 +691,7 @@ CREATE TABLE IF NOT EXISTS acertos_mao_obra (
     obra_id INTEGER NOT NULL,
     profissional_id INTEGER NOT NULL,
     valor_acerto REAL NOT NULL DEFAULT 0,
-    atualizado_em TEXT NOT NULL DEFAULT (datetime('now')),
+    atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(periodo_id, obra_id, profissional_id)
 )
 """)
